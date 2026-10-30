@@ -29,7 +29,7 @@ export default function Home() {
   const [activeStep, setActiveStep] = useState(0);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
-  const [backendStatus, setBackendStatus] = useState({ checked: false, online: false, device: "unknown" });
+  const [backendStatus, setBackendStatus] = useState({ checked: false, online: false, device: "unknown", geminiConfigured: false });
   const [isDragOver, setIsDragOver] = useState(false);
 
   const fileInputRef = useRef(null);
@@ -41,12 +41,12 @@ export default function Home() {
         const res = await fetch(`${API}/api/health`, { method: "GET" });
         if (res.ok) {
           const data = await res.json();
-          setBackendStatus({ checked: true, online: true, device: data.device || "cpu" });
+          setBackendStatus({ checked: true, online: true, device: data.device || "cpu", geminiConfigured: !!data.gemini_configured });
         } else {
-          setBackendStatus({ checked: true, online: false, device: "offline" });
+          setBackendStatus({ checked: true, online: false, device: "offline", geminiConfigured: false });
         }
       } catch {
-        setBackendStatus({ checked: true, online: false, device: "offline" });
+        setBackendStatus({ checked: true, online: false, device: "offline", geminiConfigured: false });
       }
     }
     checkHealth();
@@ -167,6 +167,17 @@ export default function Home() {
           Turn any lecture topic, text notes, or spoken audio into a fully narrated educational video with cinematic stock footage, AI visuals, and synchronized subtitles.
         </p>
       </section>
+
+      {/* Gemini setup notice */}
+      {backendStatus.checked && backendStatus.online && !backendStatus.geminiConfigured && (
+        <div className="notice-box">
+          <strong>Add a Gemini API key for real explanations.</strong>
+          <span>
+            Without it, the narration falls back to a generic outline instead of explaining your topic. Open
+            <code> backend/.env </code> and set <code>GEMINI_API_KEY</code>.
+          </span>
+        </div>
+      )}
 
       {/* Generator Form Panel */}
       <section className="panel">

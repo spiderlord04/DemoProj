@@ -518,15 +518,26 @@ def build_educational_slide(title, sentence_text, step_idx, total_steps, output_
     img.save(output_path, "PNG")
 
 def create_educational_script(raw_input):
-    """Generate structured educational lecture script via Gemini with fallback."""
+    """Generate an informative educational script via Gemini, with a structured fallback."""
     global gemini_model
     if gemini_model is not None:
         try:
             prompt = (
-                "You are an inspiring educator and professor. Write a structured, engaging, and clear "
-                "spoken educational mini-lecture of 5 to 7 sentences about the following subject. "
-                "The text will be spoken directly by an audio voiceover. "
-                "Return ONLY the spoken sentences. Do not include markdown headers, bold formatting, bullet points, asterisks, or speaker tags.\n\n"
+                "You are an expert teacher writing the narration for a short educational video.\n\n"
+                "Write 5 to 7 short spoken sentences that genuinely EXPLAIN the subject. "
+                "Structure them as:\n"
+                "1) one opening sentence that defines or frames the subject,\n"
+                "2) three to four sentences that each teach ONE concrete, specific key point about the subject "
+                "(a real fact, how it works, or why it matters),\n"
+                "3) one short closing sentence.\n\n"
+                "Rules:\n"
+                "- Be specific to the subject; teach real information about it.\n"
+                "- NEVER use vague filler such as \"understanding this topic requires looking closely at its principles\", "
+                "\"each core component interacts systematically\", or \"gives us a deeper appreciation of the fundamentals\".\n"
+                "- Do not restate the subject name in every sentence.\n"
+                "- Keep each sentence under 25 words so it fits the narration time.\n"
+                "- No markdown, no bullet points, no asterisks, no headings, no speaker tags.\n"
+                "- Return ONLY the spoken sentences.\n\n"
                 f"Subject: {raw_input}"
             )
             response = gemini_model.generate_content(prompt)
@@ -538,15 +549,30 @@ def create_educational_script(raw_input):
         except Exception as e:
             app.logger.warning(f"Gemini API generation failed: {e}")
 
-    # Fallback structured educational script
-    topic_cleaned = raw_input.strip().rstrip(".").title()
+    # Fallback: no AI model configured, so build a clearly structured topic outline.
+    topic_cleaned = raw_input.strip().rstrip(".")
+    app.logger.warning(
+        "GEMINI_API_KEY is not configured - using a generic template script. "
+        "Add a Gemini API key for real topic explanations."
+    )
+    question_words = ("what", "why", "how", "who", "when", "where", "is", "are", "does", "do", "can", "should")
+    is_question = topic_cleaned.lower().startswith(question_words)
+    if is_question:
+        return (
+            f"Let's answer the question: {topic_cleaned}. "
+            "First, the core idea and the definition that matters. "
+            "Next, the main parts that make it work and how they connect. "
+            "Then, why it matters and where it is used in practice. "
+            "Finally, a common misunderstanding to avoid. "
+            "Add a Gemini API key to replace this outline with a real explanation of the topic."
+        )
     return (
-        f"Welcome to this educational lesson exploring {topic_cleaned}. "
-        "Understanding this topic requires looking closely at its primary principles and practical behavior. "
-        "Each core component interacts systematically to produce measurable and predictable outcomes. "
-        "In modern applications, this concept helps researchers and engineers solve complex challenges. "
-        "Observing these dynamics gives us a deeper appreciation for the underlying fundamentals. "
-        "Thank you for exploring this educational overview of the subject."
+        f"Let's explore {topic_cleaned}. "
+        f"First, the core idea: what {topic_cleaned} actually means. "
+        "Next, the main parts that make it work and how they connect. "
+        f"Then, why {topic_cleaned} matters and where it is used in practice. "
+        f"Finally, a common misunderstanding about {topic_cleaned} to avoid. "
+        "Add a Gemini API key to replace this outline with a real explanation of the topic."
     )
 
 def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, topic_title):

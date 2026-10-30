@@ -500,6 +500,31 @@ textarea:focus {
   margin-bottom: 2px;
 }
 
+.notice-box {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 900px;
+  margin: 0 auto 8px;
+  padding: 14px 20px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 139, 43, 0.1);
+  border: 1px solid rgba(255, 139, 43, 0.35);
+  color: #ffd0a3;
+  font-size: 0.9rem;
+}
+
+.notice-box strong {
+  color: #ffb066;
+}
+
+.notice-box code {
+  background: rgba(255, 255, 255, 0.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
 /* Video Showcase Section */
 .video-preview-wrapper {
   position: relative;

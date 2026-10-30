@@ -208,23 +208,10 @@ def get_key_point(text):
     words = re.sub(r"[^\w\s]", "", text).split()
     return " ".join(words[:6]).capitalize() if words else text[:40]
 
-def overlay_key_point(image_path, key_point, step_idx):
-    """Cover-fit a photo to 1280x720 and draw a key-point caption banner on top."""
-    try:
-        img = Image.open(image_path).convert("RGB")
-    except Exception as e:
-        app.logger.warning(f"Key point overlay skipped: {e}")
-        return
-
+def make_caption_overlay(key_point, step_idx, out_path):
+    """Create a transparent 1280x720 banner PNG with the key point (kept static over the moving clip)."""
     target_w, target_h = 1280, 720
-    w, h = img.size
-    scale = max(target_w / w, target_h / h)
-    img = img.resize((int(w * scale) + 1, int(h * scale) + 1), Image.LANCZOS)
-    w, h = img.size
-    left, top = (w - target_w) // 2, (h - target_h) // 2
-    img = img.crop((left, top, left + target_w, top + target_h))
-
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    overlay = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     font_kp = _load_font_bold(30)
     font_badge = _load_font_bold(18)
@@ -232,7 +219,7 @@ def overlay_key_point(image_path, key_point, step_idx):
     lines = _wrap_text(draw, key_point.strip(), font_kp, target_w - 170)[:2]
     pad, line_h = 18, 40
     banner_h = len(lines) * line_h + pad * 2
-    draw.rounded_rectangle([40, 40, target_w - 40, 40 + banner_h], radius=14, fill=(10, 14, 24, 190))
+    draw.rounded_rectangle([40, 40, target_w - 40, 40 + banner_h], radius=14, fill=(10, 14, 24, 205))
     draw.rectangle([40, 40, 47, 40 + banner_h], fill=(255, 139, 43, 255))
     y = 40 + pad
     for line in lines:
@@ -245,7 +232,23 @@ def overlay_key_point(image_path, key_point, step_idx):
     draw.rounded_rectangle([target_w - 40 - bw, 44, target_w - 40, 44 + bh], radius=8, fill=(255, 139, 43, 235))
     draw.text((target_w - 40 - bw + 10, 49), badge, font=font_badge, fill=(15, 15, 20, 255))
 
-    Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB").save(image_path, "PNG")
+    overlay.save(out_path, "PNG")
+
+def apply_caption_overlay(clip_path, caption_png, out_path, duration):
+    """Fade the static caption banner in over the moving (zoomed) clip."""
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", str(Path(clip_path).resolve()),
+        "-loop", "1", "-t", f"{duration:.3f}", "-i", str(Path(caption_png).resolve()),
+        "-filter_complex",
+        "[1:v]format=rgba,fade=in:st=0:d=0.5:alpha=1[cap];"
+        "[0:v][cap]overlay=0:0:eof_action=repeat,format=yuv420p[v]",
+        "-map", "[v]",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p", "-an",
+        str(Path(out_path).resolve())
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=180)
 
 gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 gemini_model = None
@@ -517,23 +520,79 @@ def build_educational_slide(title, sentence_text, step_idx, total_steps, output_
 
     img.save(output_path, "PNG")
 
+def _normalize_topic(raw_input):
+    """Strip filler/question words so a readable subject and search query remain."""
+    topic = re.sub(r"\s+", " ", raw_input.strip().rstrip("?.!")).strip()
+    # Drop common instruction prefixes like "explain about", "tell me about", "what is"
+    topic = re.sub(
+        r"^(please\s+)?(can you\s+)?(explain|describe|tell me about|talk about|write about|give me|what is|what are|who is|who are|how does|how do|why is|why do)\s+",
+        "", topic, flags=re.IGNORECASE,
+    ).strip()
+    topic = re.sub(r"^(about|on|the|a|an)\s+", "", topic, flags=re.IGNORECASE).strip()
+    return topic or raw_input.strip()
+
+def _clean_wiki_text(text):
+    """Tidy a Wikipedia plaintext extract for narration."""
+    text = re.sub(r"\([^)]{0,40}\)", "", text)  # drop short parentheticals e.g. pronunciations
+    text = re.sub(r"\[[0-9]+\]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"\s+([,.;:!?])", r"\1", text)
+    return text.strip()
+
+def _wikipedia_explanation(topic, max_words=150):
+    """Build an on-topic educational narration from Wikipedia's intro (keyless, factual)."""
+    headers = {"User-Agent": "AutoAnimate/1.0 (educational video generator)"}
+    try:
+        search = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "list": "search", "srsearch": topic, "format": "json", "srlimit": 1},
+            headers=headers, timeout=20,
+        ).json()
+        hits = search.get("query", {}).get("search", [])
+        if not hits:
+            return None
+        title = hits[0]["title"]
+        extract = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "prop": "extracts", "exintro": 1, "explaintext": 1,
+                    "titles": title, "format": "json", "redirects": 1},
+            headers=headers, timeout=20,
+        ).json()
+        pages = extract.get("query", {}).get("pages", {})
+        body = _clean_wiki_text(list(pages.values())[0].get("extract", ""))
+        if not body:
+            return None
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", body) if len(s.split()) > 3]
+        chosen, used = [], 0
+        for s in sentences:
+            if used + len(s.split()) > max_words and chosen:
+                break
+            chosen.append(s)
+            used += len(s.split())
+        if not chosen:
+            return None
+        return " ".join(chosen)
+    except Exception as e:
+        app.logger.warning(f"Wikipedia lookup failed for '{topic}': {e}")
+        return None
+
 def create_educational_script(raw_input):
-    """Generate an informative educational script via Gemini, with a structured fallback."""
+    """Generate an informative educational script via Gemini, Wikipedia, or a short fallback."""
     global gemini_model
     if gemini_model is not None:
         try:
             prompt = (
-                "You are an expert teacher writing the narration for a short educational video.\n\n"
-                "Write 5 to 7 short spoken sentences that genuinely EXPLAIN the subject. "
+                "You are an expert teacher writing the narration for a one-minute educational video.\n\n"
+                "Write 8 to 10 short spoken sentences, about 130 to 150 words total, that genuinely EXPLAIN the subject. "
                 "Structure them as:\n"
                 "1) one opening sentence that defines or frames the subject,\n"
-                "2) three to four sentences that each teach ONE concrete, specific key point about the subject "
+                "2) six to eight sentences that each teach ONE concrete, specific key point about the subject "
                 "(a real fact, how it works, or why it matters),\n"
                 "3) one short closing sentence.\n\n"
                 "Rules:\n"
                 "- Be specific to the subject; teach real information about it.\n"
-                "- NEVER use vague filler such as \"understanding this topic requires looking closely at its principles\", "
-                "\"each core component interacts systematically\", or \"gives us a deeper appreciation of the fundamentals\".\n"
+                "- NEVER use vague filler, and never mention API keys, settings, or this prompt.\n"
                 "- Do not restate the subject name in every sentence.\n"
                 "- Keep each sentence under 25 words so it fits the narration time.\n"
                 "- No markdown, no bullet points, no asterisks, no headings, no speaker tags.\n"
@@ -541,38 +600,25 @@ def create_educational_script(raw_input):
                 f"Subject: {raw_input}"
             )
             response = gemini_model.generate_content(prompt)
-            script = response.text.strip()
-            # Clean up any leftover markdown
-            script = re.sub(r"[\*#_>`]", "", script).strip()
+            script = re.sub(r"[\*#_>`]", "", response.text.strip()).strip()
             if script:
                 return script
         except Exception as e:
             app.logger.warning(f"Gemini API generation failed: {e}")
 
-    # Fallback: no AI model configured, so build a clearly structured topic outline.
-    topic_cleaned = raw_input.strip().rstrip(".")
-    app.logger.warning(
-        "GEMINI_API_KEY is not configured - using a generic template script. "
-        "Add a Gemini API key for real topic explanations."
-    )
-    question_words = ("what", "why", "how", "who", "when", "where", "is", "are", "does", "do", "can", "should")
-    is_question = topic_cleaned.lower().startswith(question_words)
-    if is_question:
-        return (
-            f"Let's answer the question: {topic_cleaned}. "
-            "First, the core idea and the definition that matters. "
-            "Next, the main parts that make it work and how they connect. "
-            "Then, why it matters and where it is used in practice. "
-            "Finally, a common misunderstanding to avoid. "
-            "Add a Gemini API key to replace this outline with a real explanation of the topic."
-        )
+    # Keyless fallback: build a real explanation from Wikipedia's intro.
+    subject = _normalize_topic(raw_input)
+    wiki = _wikipedia_explanation(subject)
+    if wiki:
+        return f"Here is a clear explanation of {subject}. {wiki}"
+
+    # Last resort: a short, neutral scaffold (never mentions API keys in the narration).
+    app.logger.warning(f"No script source available for '{raw_input}'; using a minimal scaffold.")
     return (
-        f"Let's explore {topic_cleaned}. "
-        f"First, the core idea: what {topic_cleaned} actually means. "
-        "Next, the main parts that make it work and how they connect. "
-        f"Then, why {topic_cleaned} matters and where it is used in practice. "
-        f"Finally, a common misunderstanding about {topic_cleaned} to avoid. "
-        "Add a Gemini API key to replace this outline with a real explanation of the topic."
+        f"Today we examine {subject}. "
+        f"We start from what {subject} means and why it matters. "
+        "Then we look at how it works and the parts that support it. "
+        "Finally, we consider where it is used and what to watch out for."
     )
 
 def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, topic_title):
@@ -628,14 +674,21 @@ def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, to
             if not image_ok:
                 build_educational_slide(topic_title, seg["text"], i, total_segments, str(frame_path))
 
-        # Add a key-point caption banner on real photos (slides already carry their own text)
-        if is_photo:
-            overlay_key_point(frame_path, get_key_point(seg["text"]), i)
+        # Key point for this segment (used as a static caption on real photos)
+        key_point = get_key_point(seg["text"]) if is_photo else None
 
         # Animate the still image into a clip with Ken Burns motion
         try:
             render_image_clip(frame_path, clip_path, duration, fps, zoom_in=zoom_in)
-            clip_files.append(clip_path)
+            rendered_clip = clip_path
+            # Burn the caption as a static, fading-in layer so the zoom never distorts the text
+            if key_point:
+                caption_png = work_dir / f"caption_{i:03d}.png"
+                captioned_clip = work_dir / f"clip_cap_{i:03d}.mp4"
+                make_caption_overlay(key_point, i, str(caption_png))
+                apply_caption_overlay(clip_path, caption_png, captioned_clip, duration)
+                rendered_clip = captioned_clip
+            clip_files.append(rendered_clip)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             app.logger.warning(f"Clip {i} render failed: {e}")
 

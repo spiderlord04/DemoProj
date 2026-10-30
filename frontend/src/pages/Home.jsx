@@ -15,8 +15,8 @@ const GENERATION_STEPS = [
   "Analyzing educational prompt and inputs",
   "Crafting structured lecture script with Gemini",
   "Synthesizing voiceover audio narration",
+  "Fetching topical images and applying motion",
   "Aligning subtitle timestamps and speech segments",
-  "Generating high-resolution educational visuals",
   "Composing subtitles and rendering final MP4 video"
 ];
 
@@ -164,7 +164,7 @@ export default function Home() {
         <span className="eyebrow">Generative AI • Educational Studio</span>
         <h1>AI Video Generation</h1>
         <p className="lead">
-          Turn any lecture topic, text notes, or spoken audio into a fully narrated educational video with AI visuals and synchronized subtitles.
+          Turn any lecture topic, text notes, or spoken audio into a fully narrated educational video with cinematic stock footage, AI visuals, and synchronized subtitles.
         </p>
       </section>
 

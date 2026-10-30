@@ -59,7 +59,194 @@ if os.path.exists(FFMPEG_BIN):
     if ffmpeg_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
 
-# Gemini AI Client
+import requests
+
+# Stock Video Configuration
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
+
+def get_keywords_from_text(text):
+    """Use Gemini to extract a few simple search keywords for stock footage."""
+    global gemini_model
+    if gemini_model:
+        try:
+            prompt = f"Extract 2-3 simple keywords for a stock video search that represents this sentence: \"{text}\". Return ONLY the keywords separated by spaces."
+            res = gemini_model.generate_content(prompt)
+            return res.text.strip().lower()
+        except:
+            pass
+    # Fallback: just use first 3 words
+    words = [w for w in re.sub(r'[^\w\s]', '', text).split() if len(w) > 3]
+    return " ".join(words[:3])
+
+def fetch_stock_video(query, output_path, duration_target):
+    """Search Pexels for a relevant video clip and download it."""
+    if not PEXELS_API_KEY:
+        return False
+    
+    try:
+        headers = {"Authorization": PEXELS_API_KEY}
+        url = f"https://api.pexels.com/videos/search?query={query}&per_page=1&orientation=landscape"
+        res = requests.get(url, headers=headers, timeout=10)
+        data = res.json()
+        
+        if data.get("videos"):
+            video = data["videos"][0]
+            # Get the HD file link
+            files = video.get("video_files", [])
+            # Prefer mp4 and width around 1280 or 1920
+            best_file = None
+            for f in files:
+                if f.get("file_type") == "video/mp4":
+                    if not best_file or abs(f.get("width", 0) - 1280) < abs(best_file.get("width", 0) - 1280):
+                        best_file = f
+            
+            if best_file:
+                v_res = requests.get(best_file["link"], stream=True, timeout=30)
+                with open(output_path, 'wb') as f:
+                    for chunk in v_res.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                return True
+    except Exception as e:
+        app.logger.warning(f"Stock video fetch failed for '{query}': {e}")
+    return False
+
+def _download_image(url, output_path):
+    try:
+        resp = requests.get(url, timeout=20,
+                            headers={"User-Agent": "AutoAnimate/1.0 (educational video generator)"})
+        if resp.status_code == 200 and len(resp.content) > 5000:
+            with open(output_path, "wb") as f:
+                f.write(resp.content)
+            return True
+    except Exception:
+        pass
+    return False
+
+def _wikimedia_image(query):
+    """Keyless, license-friendly image search on Wikimedia Commons."""
+    try:
+        resp = requests.get(
+            "https://commons.wikimedia.org/w/api.php",
+            params={
+                "action": "query", "format": "json", "generator": "search",
+                "gsrsearch": f"filetype:bitmap {query}", "gsrlimit": 5, "gsrnamespace": 6,
+                "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 1280,
+            },
+            headers={"User-Agent": "AutoAnimate/1.0 (educational video generator)"},
+            timeout=20,
+        )
+        pages = resp.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            info = page.get("imageinfo") or []
+            if info and info[0].get("thumburl"):
+                yield info[0]["thumburl"]
+    except Exception as e:
+        app.logger.warning(f"Wikimedia image search failed for '{query}': {e}")
+
+def _duckduckgo_images(query):
+    """Keyless image search via DuckDuckGo (secondary source)."""
+    try:
+        from duckduckgo_search import DDGS
+        for r in DDGS().images(query, max_results=6, safesearch="moderate"):
+            if r.get("image"):
+                yield r["image"]
+    except Exception as e:
+        app.logger.warning(f"DuckDuckGo image search failed for '{query}': {e}")
+
+def fetch_topic_image(query, output_path):
+    """Fetch a topical image without an API key, trying multiple sources."""
+    for source in (_wikimedia_image, _duckduckgo_images):
+        for url in source(query):
+            if _download_image(url, output_path):
+                return True
+    return False
+
+def render_image_clip(image_path, clip_path, duration, fps, zoom_in=True):
+    """Turn a still image into a video clip with a clearly visible Ken Burns motion effect."""
+    total_frames = max(int(round(duration * fps)), 1)
+    # Zoom across the clip and add a gentle drift so the motion reads as real video.
+    if zoom_in:
+        zoom_expr = "min(1.0+0.0028*on,1.4)"
+    else:
+        zoom_expr = "max(1.4-0.0028*on,1.0)"
+    x_expr = "iw/2-(iw/zoom/2)+sin(on/45)*45"
+    y_expr = "ih/2-(ih/zoom/2)+cos(on/55)*30"
+    vf = (
+        "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,"
+        f"zoompan=z='{zoom_expr}':x='{x_expr}':y='{y_expr}':d={total_frames}:s=1280x720:fps={fps},"
+        "format=yuv420p"
+    )
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-loop", "1",
+        "-i", str(Path(image_path).resolve()),
+        "-frames:v", str(total_frames),
+        "-vf", vf,
+        "-r", str(fps),
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
+        "-an",
+        str(Path(clip_path).resolve())
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+
+def get_key_point(text):
+    """Produce a short on-screen key point (at most ~6 words) for a sentence."""
+    global gemini_model
+    if gemini_model:
+        try:
+            prompt = (
+                "Summarize the following sentence as a short on-screen key point of at most 6 words. "
+                "Return ONLY the key point, no quotes and no trailing punctuation.\n\n"
+                f"Sentence: {text}"
+            )
+            kp = gemini_model.generate_content(prompt).text.strip().strip('"').strip()
+            if kp:
+                return kp
+        except Exception:
+            pass
+    words = re.sub(r"[^\w\s]", "", text).split()
+    return " ".join(words[:6]).capitalize() if words else text[:40]
+
+def overlay_key_point(image_path, key_point, step_idx):
+    """Cover-fit a photo to 1280x720 and draw a key-point caption banner on top."""
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        app.logger.warning(f"Key point overlay skipped: {e}")
+        return
+
+    target_w, target_h = 1280, 720
+    w, h = img.size
+    scale = max(target_w / w, target_h / h)
+    img = img.resize((int(w * scale) + 1, int(h * scale) + 1), Image.LANCZOS)
+    w, h = img.size
+    left, top = (w - target_w) // 2, (h - target_h) // 2
+    img = img.crop((left, top, left + target_w, top + target_h))
+
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    font_kp = _load_font_bold(30)
+    font_badge = _load_font_bold(18)
+
+    lines = _wrap_text(draw, key_point.strip(), font_kp, target_w - 170)[:2]
+    pad, line_h = 18, 40
+    banner_h = len(lines) * line_h + pad * 2
+    draw.rounded_rectangle([40, 40, target_w - 40, 40 + banner_h], radius=14, fill=(10, 14, 24, 190))
+    draw.rectangle([40, 40, 47, 40 + banner_h], fill=(255, 139, 43, 255))
+    y = 40 + pad
+    for line in lines:
+        draw.text((70, y), line, font=font_kp, fill=(255, 255, 255, 255))
+        y += line_h
+
+    badge = f"{step_idx:02d}"
+    bb = draw.textbbox((0, 0), badge, font=font_badge)
+    bw, bh = bb[2] - bb[0] + 20, bb[3] - bb[1] + 12
+    draw.rounded_rectangle([target_w - 40 - bw, 44, target_w - 40, 44 + bh], radius=8, fill=(255, 139, 43, 235))
+    draw.text((target_w - 40 - bw + 10, 49), badge, font=font_badge, fill=(15, 15, 20, 255))
+
+    Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB").save(image_path, "PNG")
+
 gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
 gemini_model = None
 gemini_model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
@@ -152,67 +339,181 @@ def get_audio_duration(audio_path):
         app.logger.warning(f"Duration inspection error: {e}")
     return 15.0
 
+def _load_font(size):
+    """Load a TrueType font, falling back through common system locations."""
+    font_candidates = [
+        "C:/Windows/Fonts/segoeui.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/calibri.ttf",
+        "C:/Windows/Fonts/tahoma.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    for fp in font_candidates:
+        if os.path.isfile(fp):
+            return ImageFont.truetype(fp, size)
+    # Last resort: Pillow default (bitmap, not resizable — use size 10 max)
+    return ImageFont.load_default()
+
+def _load_font_bold(size):
+    """Load a bold TrueType font."""
+    font_candidates = [
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/calibrib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    ]
+    for fp in font_candidates:
+        if os.path.isfile(fp):
+            return ImageFont.truetype(fp, size)
+    return _load_font(size)
+
+def _wrap_text(draw, text, font, max_width):
+    """Word-wrap text using actual font metrics."""
+    words = text.split()
+    lines = []
+    current = []
+    for word in words:
+        test = " ".join(current + [word])
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if bbox[2] - bbox[0] > max_width and current:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+# Color palettes for different slide layouts — gives visual variety
+SLIDE_PALETTES = [
+    {"bg_top": (10, 15, 30), "bg_bot": (20, 30, 55), "accent": (255, 139, 43), "card": (18, 24, 42)},
+    {"bg_top": (8, 20, 28),  "bg_bot": (15, 35, 50), "accent": (0, 200, 180),  "card": (14, 28, 40)},
+    {"bg_top": (18, 10, 28), "bg_bot": (30, 18, 50), "accent": (180, 120, 255),"card": (25, 16, 42)},
+    {"bg_top": (10, 18, 12), "bg_bot": (18, 35, 22), "accent": (100, 220, 100),"card": (15, 28, 18)},
+    {"bg_top": (25, 12, 12), "bg_bot": (45, 20, 22), "accent": (255, 90, 90),  "card": (35, 18, 18)},
+    {"bg_top": (12, 15, 28), "bg_bot": (22, 28, 55), "accent": (80, 160, 255), "card": (18, 22, 45)},
+]
+
 def build_educational_slide(title, sentence_text, step_idx, total_steps, output_path):
-    """Generate high-resolution 1280x720 educational slides with typography and cards."""
+    """Generate high-resolution 1280x720 educational slides with large readable fonts and varied layouts."""
     width, height = 1280, 720
     img = Image.new("RGB", (width, height), color=(14, 17, 26))
     draw = ImageDraw.Draw(img)
 
-    # Vibrant vertical background gradient
+    # Pick a palette based on step index for visual variety
+    pal = SLIDE_PALETTES[step_idx % len(SLIDE_PALETTES)]
+
+    # Load real fonts at proper sizes
+    font_title = _load_font_bold(32)
+    font_body = _load_font(28)
+    font_badge = _load_font_bold(16)
+    font_step = _load_font(18)
+    font_big_num = _load_font_bold(120)
+
+    # Background gradient
     for y in range(height):
-        r = int(14 + (24 - 14) * (y / height))
-        g = int(17 + (32 - 17) * (y / height))
-        b = int(26 + (50 - 26) * (y / height))
+        t = y / height
+        r = int(pal["bg_top"][0] + (pal["bg_bot"][0] - pal["bg_top"][0]) * t)
+        g = int(pal["bg_top"][1] + (pal["bg_bot"][1] - pal["bg_top"][1]) * t)
+        b = int(pal["bg_top"][2] + (pal["bg_bot"][2] - pal["bg_top"][2]) * t)
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
-    # Decorative top glow accent
-    draw.rectangle([0, 0, width, 6], fill=(255, 139, 43))
+    # Add abstract visual patterns (circles and lines) for "video-like" visuals
+    import random
+    random.seed(step_idx) # Keep patterns consistent for the same slide
+    for _ in range(15):
+        x = random.randint(0, width)
+        y = random.randint(0, height)
+        size = random.randint(50, 300)
+        alpha = random.randint(10, 30)
+        draw.ellipse([x, y, x + size, y + size], outline=(*pal["accent"], alpha), width=random.randint(1, 3))
+    
+    for _ in range(10):
+        x1 = random.randint(0, width)
+        y1 = random.randint(0, height)
+        x2 = x1 + random.randint(-200, 200)
+        y2 = y1 + random.randint(-200, 200)
+        alpha = random.randint(5, 20)
+        draw.line([(x1, y1), (x2, y2)], fill=(*pal["accent"], alpha), width=1)
 
-    # Outer decorative card
-    card_margin_x, card_margin_y = 70, 70
-    card_box = [card_margin_x, card_margin_y, width - card_margin_x, height - card_margin_y]
-    draw.rounded_rectangle(card_box, radius=24, fill=(21, 26, 40), outline=(45, 55, 80), width=2)
+    # Top accent bar
+    draw.rectangle([0, 0, width, 5], fill=pal["accent"])
+    # Bottom accent bar
+    draw.rectangle([0, height - 5, width, height], fill=pal["accent"])
 
-    # Header badge: "AUTOANIMATE • EDUCATIONAL LECTURE"
-    badge_text = "AUTOANIMATE • AI EDUCATIONAL VISUAL"
-    draw.rounded_rectangle([card_margin_x + 36, card_margin_y + 36, card_margin_x + 340, card_margin_y + 70], radius=8, fill=(255, 139, 43))
-    draw.text((card_margin_x + 50, card_margin_y + 44), badge_text, fill=(18, 21, 32))
+    # Left side: big step number watermark
+    num_text = f"{step_idx:02d}"
+    draw.text((40, height // 2 - 80), num_text, fill=(*pal["accent"], ), font=font_big_num)
+    # Dim overlay on the number so it looks like a watermark
+    overlay = Image.new("RGBA", (200, 200), (*pal["bg_top"], 160))
+    img.paste(Image.blend(
+        img.crop((30, height // 2 - 90, 230, height // 2 + 110)).convert("RGBA"),
+        overlay,
+        alpha=0.55
+    ).convert("RGB"), (30, height // 2 - 90))
+    draw = ImageDraw.Draw(img)  # Refresh draw after paste
+    draw.text((50, height // 2 - 75), num_text, fill=(*pal["accent"],), font=font_big_num)
 
-    # Slide sequence counter: "CONCEPT 01 OF 06"
+    # Main content card (right ~75%)
+    card_x = 240
+    card_y = 50
+    card_w = width - card_x - 50
+    card_h = height - 100
+    draw.rounded_rectangle(
+        [card_x, card_y, card_x + card_w, card_y + card_h],
+        radius=20, fill=pal["card"], outline=(*pal["accent"], ), width=2
+    )
+
+    # Badge
+    badge_text = "AUTOANIMATE"
+    badge_bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+    badge_w = badge_bbox[2] - badge_bbox[0] + 24
+    badge_h = badge_bbox[3] - badge_bbox[1] + 14
+    draw.rounded_rectangle(
+        [card_x + 30, card_y + 28, card_x + 30 + badge_w, card_y + 28 + badge_h],
+        radius=6, fill=pal["accent"]
+    )
+    draw.text((card_x + 42, card_y + 32), badge_text, fill=(15, 15, 20), font=font_badge)
+
+    # Step counter on the right
     step_text = f"SECTION {step_idx:02d} / {total_steps:02d}"
-    draw.text((width - card_margin_x - 170, card_margin_y + 46), step_text, fill=(160, 175, 205))
+    st_bbox = draw.textbbox((0, 0), step_text, font=font_step)
+    st_w = st_bbox[2] - st_bbox[0]
+    draw.text((card_x + card_w - st_w - 30, card_y + 34), step_text, fill=(160, 175, 205), font=font_step)
 
-    # Topic title
-    safe_title = (title[:55] + "...") if len(title) > 55 else title
-    draw.text((card_margin_x + 40, card_margin_y + 105), safe_title.upper(), fill=(255, 255, 255))
+    # Title
+    safe_title = (title[:60] + "...") if len(title) > 60 else title
+    title_y = card_y + 80
+    draw.text((card_x + 30, title_y), safe_title.upper(), fill=(255, 255, 255), font=font_title)
 
-    # Divider line
-    draw.line([(card_margin_x + 40, card_margin_y + 140), (width - card_margin_x - 40, card_margin_y + 140)], fill=(45, 55, 80), width=2)
+    # Divider
+    div_y = title_y + 45
+    draw.line([(card_x + 30, div_y), (card_x + card_w - 30, div_y)], fill=(*pal["accent"],), width=2)
 
-    # Main text formatting with word wrapping
-    words = sentence_text.split()
-    lines = []
-    current_line = []
-    for word in words:
-        current_line.append(word)
-        if len(" ".join(current_line)) > 42:
-            lines.append(" ".join(current_line[:-1]))
-            current_line = [word]
-    if current_line:
-        lines.append(" ".join(current_line))
+    # Body text — word-wrapped using real font metrics
+    body_max_w = card_w - 60
+    body_lines = _wrap_text(draw, sentence_text, font_body, body_max_w)
 
-    # Draw body lines
-    start_y = card_margin_y + 190
-    line_height = 48
-    for i, line in enumerate(lines[:6]):
-        draw.text((card_margin_x + 50, start_y + (i * line_height)), line, fill=(230, 235, 248))
+    body_y = div_y + 25
+    line_spacing = 42
+    max_lines = min(len(body_lines), 9)
+    for i in range(max_lines):
+        # Slight indent and bullet for each line
+        if i == 0:
+            draw.text((card_x + 30, body_y + i * line_spacing), "▸  " + body_lines[i], fill=(230, 235, 248), font=font_body)
+        else:
+            draw.text((card_x + 45, body_y + i * line_spacing), body_lines[i], fill=(200, 210, 230), font=font_body)
 
-    # Bottom progress bar indicator
-    progress_w = int((width - (card_margin_x * 2) - 80) * (step_idx / max(total_steps, 1)))
-    bar_y = height - card_margin_y - 45
-    draw.rounded_rectangle([card_margin_x + 40, bar_y, width - card_margin_x - 40, bar_y + 8], radius=4, fill=(35, 42, 60))
+    # Progress bar at bottom of card
+    bar_y = card_y + card_h - 30
+    bar_x_start = card_x + 30
+    bar_x_end = card_x + card_w - 30
+    bar_total = bar_x_end - bar_x_start
+    draw.rounded_rectangle([bar_x_start, bar_y, bar_x_end, bar_y + 8], radius=4, fill=(35, 42, 60))
+    progress_w = int(bar_total * (step_idx / max(total_steps, 1)))
     if progress_w > 0:
-        draw.rounded_rectangle([card_margin_x + 40, bar_y, card_margin_x + 40 + progress_w, bar_y + 8], radius=4, fill=(255, 139, 43))
+        draw.rounded_rectangle([bar_x_start, bar_y, bar_x_start + progress_w, bar_y + 8], radius=4, fill=pal["accent"])
 
     img.save(output_path, "PNG")
 
@@ -249,61 +550,123 @@ def create_educational_script(raw_input):
     )
 
 def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, topic_title):
-    """Generate educational frames and invoke FFmpeg to render final MP4."""
+    """Generate educational frames per segment, render each as a timed clip, then combine with audio."""
     sd = get_stable_diffusion()
-    concat_file = work_dir / "concat.txt"
     total_segments = len(segments)
+    fps = 30
+    clip_files = []
 
-    with concat_file.open("w", encoding="utf-8") as f:
-        for i, seg in enumerate(segments, 1):
-            frame_path = (work_dir / f"frame_{i:03d}.png").resolve()
-            duration = max(float(seg["end"]) - float(seg["start"]), 1.2)
+    for i, seg in enumerate(segments, 1):
+        frame_path = work_dir / f"frame_{i:03d}.png"
+        clip_path = work_dir / f"clip_{i:03d}.mp4"
+        raw_video_path = work_dir / f"raw_{i:03d}.mp4"
+        duration = max(float(seg["end"]) - float(seg["start"]), 1.5)
 
-            # Use Stable Diffusion if enabled, otherwise render HD educational slides
+        keywords = get_keywords_from_text(seg["text"])
+        zoom_in = (i % 2 == 1)
+
+        # 1) Preferred: real stock video clip (only if a Pexels key is configured)
+        if PEXELS_API_KEY and fetch_stock_video(keywords, raw_video_path, duration):
+            cmd_process = [
+                FFMPEG_BIN, "-y",
+                "-i", str(raw_video_path.resolve()),
+                "-t", f"{duration:.3f}",
+                "-vf", "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuv420p",
+                "-r", str(fps),
+                "-c:v", "libx264", "-preset", "veryfast",
+                "-an",
+                str(clip_path.resolve())
+            ]
+            try:
+                subprocess.run(cmd_process, cwd=str(work_dir), check=True, capture_output=True, timeout=120)
+                clip_files.append(clip_path)
+                continue
+            except Exception as e:
+                app.logger.warning(f"Stock video processing failed: {e}")
+
+        # 2) Keyless approach: fetch a real topical image and add motion
+        image_ok = fetch_topic_image(keywords, frame_path)
+        is_photo = image_ok
+
+        # 3) Fallback: AI image, then generated slide
+        if not image_ok:
             if sd is not None:
                 try:
                     prompt = f"Educational illustration of {seg['text']}, clean documentary style, cinematic, 16:9"
                     image = sd(prompt, num_inference_steps=20, width=768, height=432).images[0]
-                    image.resize((1280, 720)).save(frame_path)
+                    image.resize((1280, 720)).save(str(frame_path))
+                    image_ok = True
+                    is_photo = True
                 except Exception as e:
                     app.logger.warning(f"SD image generation failed, falling back to slide: {e}")
-                    build_educational_slide(topic_title, seg["text"], i, total_segments, frame_path)
-            else:
-                build_educational_slide(topic_title, seg["text"], i, total_segments, frame_path)
+            if not image_ok:
+                build_educational_slide(topic_title, seg["text"], i, total_segments, str(frame_path))
 
-            f.write(f"file '{frame_path.as_posix()}'\n")
-            f.write(f"duration {duration:.3f}\n")
+        # Add a key-point caption banner on real photos (slides already carry their own text)
+        if is_photo:
+            overlay_key_point(frame_path, get_key_point(seg["text"]), i)
 
-        # Repeat last frame to prevent FFmpeg dropping the end frame
-        last_frame = (work_dir / f"frame_{total_segments:03d}.png").resolve()
-        f.write(f"file '{last_frame.as_posix()}'\n")
+        # Animate the still image into a clip with Ken Burns motion
+        try:
+            render_image_clip(frame_path, clip_path, duration, fps, zoom_in=zoom_in)
+            clip_files.append(clip_path)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+            app.logger.warning(f"Clip {i} render failed: {e}")
+
+    if not clip_files:
+        raise RuntimeError("No video clips were produced. FFmpeg may be misconfigured.")
+
+    # Write a concat file referencing all clip videos
+    concat_file = work_dir / "concat.txt"
+    with concat_file.open("w", encoding="utf-8") as f:
+        for cf in clip_files:
+            f.write(f"file '{cf.resolve().as_posix()}'\n")
+
+    # Concatenate all clips into one silent video
+    silent_video = work_dir / "silent_merged.mp4"
+    cmd_merge = [
+        FFMPEG_BIN, "-y",
+        "-f", "concat", "-safe", "0", "-i", str(concat_file.resolve()),
+        "-c", "copy",
+        str(silent_video.resolve())
+    ]
+    subprocess.run(cmd_merge, cwd=str(work_dir), check=True, capture_output=True, timeout=300)
 
     output_path = (OUTPUTS / output_filename).resolve()
 
-    # Attempt rendering with hardcoded subtitles
-    srt_relative = "subtitles.srt"
-    cmd_with_subs = [
+    # Final pass: merge silent video + audio, optionally burn in subtitles
+    # Use relative path for subtitles to avoid Windows drive colon issues in FFmpeg filters
+    srt_rel = "subtitles.srt"
+
+    # Try with subtitles first
+    cmd_final = [
         FFMPEG_BIN, "-y",
-        "-f", "concat", "-safe", "0", "-i", "concat.txt",
+        "-i", str(silent_video.resolve()),
         "-i", str(audio_path.resolve()),
-        "-vf", f"scale=1280:720,subtitles={srt_relative}",
-        "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k",
-        "-pix_fmt", "yuv420p", "-shortest", str(output_path)
+        "-vf", f"subtitles={srt_rel}:force_style='FontSize=22,PrimaryColour=&H00FFFFFF,OutlineColour=&H80000000,Outline=2,Shadow=1,MarginV=30'",
+        "-c:v", "libx264", "-preset", "veryfast",
+        "-c:a", "aac", "-b:a", "192k",
+        "-pix_fmt", "yuv420p",
+        "-shortest",
+        str(output_path)
     ]
 
     try:
-        subprocess.run(cmd_with_subs, cwd=str(work_dir), check=True, capture_output=True)
+        subprocess.run(cmd_final, cwd=str(work_dir), check=True, capture_output=True, timeout=300)
     except subprocess.CalledProcessError as e:
-        app.logger.warning(f"FFmpeg with subtitles filter failed, falling back to clean video: {e.stderr.decode(errors='replace')}")
-        cmd_clean = [
+        app.logger.warning(f"Subtitle burn-in failed, rendering without subs: {e.stderr.decode(errors='replace')[:500]}")
+        # Fallback: no subtitles, but still re-encode to ensure compatibility and correct duration
+        cmd_nosub = [
             FFMPEG_BIN, "-y",
-            "-f", "concat", "-safe", "0", "-i", "concat.txt",
+            "-i", str(silent_video.resolve()),
             "-i", str(audio_path.resolve()),
-            "-vf", "scale=1280:720",
-            "-c:v", "libx264", "-preset", "veryfast", "-c:a", "aac", "-b:a", "192k",
-            "-pix_fmt", "yuv420p", "-shortest", str(output_path)
+            "-c:v", "libx264", "-preset", "veryfast",
+            "-c:a", "aac", "-b:a", "192k",
+            "-pix_fmt", "yuv420p",
+            "-shortest",
+            str(output_path)
         ]
-        subprocess.run(cmd_clean, cwd=str(work_dir), check=True)
+        subprocess.run(cmd_nosub, cwd=str(work_dir), check=True, capture_output=True, timeout=300)
 
     return output_path
 

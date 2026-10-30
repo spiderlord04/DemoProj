@@ -1,0 +1,13 @@
+flask
+flask-cors
+python-dotenv
+openai-whisper
+torch
+diffusers
+transformers
+accelerate
+pymongo
+dnspython
+gTTS
+google-generativeai
+numpy<2.0.0

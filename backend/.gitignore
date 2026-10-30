@@ -1,0 +1,8 @@
+__pycache__/
+.env
+.venv/
+venv/
+uploads/
+generated_videos/
+*.mp4
+*.mp3

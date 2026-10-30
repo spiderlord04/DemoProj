@@ -64,19 +64,59 @@ import requests
 # Stock Video Configuration
 PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "").strip()
 
-def get_keywords_from_text(text):
-    """Use Gemini to extract a few simple search keywords for stock footage."""
-    global gemini_model
-    if gemini_model:
-        try:
-            prompt = f"Extract 2-3 simple keywords for a stock video search that represents this sentence: \"{text}\". Return ONLY the keywords separated by spaces."
-            res = gemini_model.generate_content(prompt)
-            return res.text.strip().lower()
-        except:
-            pass
-    # Fallback: just use first 3 words
-    words = [w for w in re.sub(r'[^\w\s]', '', text).split() if len(w) > 3]
-    return " ".join(words[:3])
+_STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "for", "with", "is", "are", "was",
+    "were", "be", "been", "being", "as", "at", "by", "from", "that", "this", "these", "those", "it",
+    "its", "they", "them", "their", "there", "here", "which", "who", "whom", "whose", "what", "when",
+    "where", "why", "how", "also", "such", "can", "could", "will", "would", "shall", "should", "may",
+    "might", "must", "do", "does", "did", "done", "has", "have", "had", "not", "no", "nor", "so",
+    "than", "then", "too", "very", "just", "more", "most", "other", "others", "some", "any", "each",
+    "both", "all", "one", "two", "first", "second", "third", "using", "use", "used", "uses", "called",
+    "known", "include", "includes", "including", "about", "into", "over", "out", "up", "down",
+    "between", "during", "through", "after", "before", "while", "because", "however", "therefore",
+    "thus", "many", "much", "often", "still", "even", "explain", "describe", "tell", "give", "write",
+    "explanation", "explains", "explaining", "clear", "clearly", "means", "matter", "matters",
+    "important", "importance", "overview", "concept", "concepts", "idea", "ideas", "example",
+    "examples", "topic", "subject", "lesson", "video", "understand", "understanding", "discuss",
+    "discussion", "consider", "today", "start",
+}
+
+def _query_words(text):
+    """Meaningful lowercase words used to judge whether an image title matches a query."""
+    return {w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) > 1 and w not in _STOPWORDS}
+
+def _extract_keywords(text, limit=2):
+    """Pick the most distinctive words from a sentence (longer words first), ignoring stopwords."""
+    seen, candidates = set(), []
+    for w in re.findall(r"[A-Za-z][A-Za-z\-]{2,}", text):
+        lw = w.lower()
+        if lw in _STOPWORDS or lw in seen:
+            continue
+        seen.add(lw)
+        candidates.append(w)
+    candidates.sort(key=len, reverse=True)
+    return candidates[:limit]
+
+def _image_queries(topic, text):
+    """Build search queries anchored on the topic so images stay relevant."""
+    topic = (topic or "").strip()
+    keywords = _extract_keywords(text, limit=2)
+    queries, seen = [], set()
+
+    def add(q):
+        q = re.sub(r"\s+", " ", q).strip()
+        if q and q.lower() not in seen:
+            seen.add(q.lower())
+            queries.append(q)
+
+    if topic:
+        for kw in keywords:
+            if kw.lower() not in topic.lower():
+                add(f"{topic} {kw}")
+        add(topic)
+    if keywords:
+        add(" ".join(keywords))
+    return queries
 
 def fetch_stock_video(query, output_path, duration_target):
     """Search Pexels for a relevant video clip and download it."""
@@ -123,40 +163,78 @@ def _download_image(url, output_path):
     return False
 
 def _wikimedia_image(query):
-    """Keyless, license-friendly image search on Wikimedia Commons."""
+    """Keyless, license-friendly image search on Wikimedia Commons, best title match first."""
     try:
         resp = requests.get(
             "https://commons.wikimedia.org/w/api.php",
             params={
                 "action": "query", "format": "json", "generator": "search",
-                "gsrsearch": f"filetype:bitmap {query}", "gsrlimit": 5, "gsrnamespace": 6,
+                "gsrsearch": f"filetype:bitmap {query}", "gsrlimit": 10, "gsrnamespace": 6,
                 "prop": "imageinfo", "iiprop": "url", "iiurlwidth": 1280,
             },
             headers={"User-Agent": "AutoAnimate/1.0 (educational video generator)"},
             timeout=20,
         )
         pages = resp.json().get("query", {}).get("pages", {})
+        query_words = _query_words(query)
+        scored = []
         for page in pages.values():
             info = page.get("imageinfo") or []
-            if info and info[0].get("thumburl"):
-                yield info[0]["thumburl"]
+            if not info or not info[0].get("thumburl"):
+                continue
+            # Only keep images whose file title actually mentions the search terms.
+            score = len(query_words & _query_words(page.get("title", "")))
+            scored.append((score, info[0]["thumburl"]))
+        scored.sort(key=lambda item: -item[0])
+        for score, url in scored:
+            if score > 0:
+                yield url
     except Exception as e:
         app.logger.warning(f"Wikimedia image search failed for '{query}': {e}")
 
 def _duckduckgo_images(query):
-    """Keyless image search via DuckDuckGo (secondary source)."""
+    """Keyless image search via DuckDuckGo (secondary source), best title match first."""
     try:
         from duckduckgo_search import DDGS
-        for r in DDGS().images(query, max_results=6, safesearch="moderate"):
-            if r.get("image"):
-                yield r["image"]
+        query_words = _query_words(query)
+        scored = []
+        for r in DDGS().images(query, max_results=10, safesearch="moderate"):
+            if not r.get("image"):
+                continue
+            score = len(query_words & _query_words(r.get("title", "")))
+            scored.append((score, r["image"]))
+        scored.sort(key=lambda item: -item[0])
+        for score, url in scored:
+            if score > 0:
+                yield url
     except Exception as e:
         app.logger.warning(f"DuckDuckGo image search failed for '{query}': {e}")
 
-def fetch_topic_image(query, output_path):
-    """Fetch a topical image without an API key, trying multiple sources."""
+# Cached image search results so each segment does not repeat the same network requests
+_image_pool = {}
+
+def _search_images(query):
+    """Return a scored list of candidate image URLs for a query, cached across segments."""
+    key = query.lower().strip()
+    if key in _image_pool:
+        return _image_pool[key]
+    urls = []
     for source in (_wikimedia_image, _duckduckgo_images):
-        for url in source(query):
+        urls.extend(source(query))
+        if len(urls) >= 6:
+            break
+    _image_pool[key] = urls
+    return urls
+
+def fetch_topic_image(queries, output_path):
+    """Fetch a relevant image without an API key, rotating through cached results for variety."""
+    if isinstance(queries, str):
+        queries = [queries]
+    for query in queries:
+        candidates = _search_images(query)
+        for _ in range(len(candidates)):
+            url = candidates.pop(0)
+            candidates.append(url)  # rotate so the next segment gets a different image
             if _download_image(url, output_path):
                 return True
     return False
@@ -634,11 +712,11 @@ def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, to
         raw_video_path = work_dir / f"raw_{i:03d}.mp4"
         duration = max(float(seg["end"]) - float(seg["start"]), 1.5)
 
-        keywords = get_keywords_from_text(seg["text"])
+        queries = _image_queries(topic_title, seg["text"])
         zoom_in = (i % 2 == 1)
 
         # 1) Preferred: real stock video clip (only if a Pexels key is configured)
-        if PEXELS_API_KEY and fetch_stock_video(keywords, raw_video_path, duration):
+        if PEXELS_API_KEY and fetch_stock_video(" ".join(queries[:1]) if queries else topic_title, raw_video_path, duration):
             cmd_process = [
                 FFMPEG_BIN, "-y",
                 "-i", str(raw_video_path.resolve()),
@@ -657,7 +735,7 @@ def assemble_video(work_dir, segments, audio_path, srt_path, output_filename, to
                 app.logger.warning(f"Stock video processing failed: {e}")
 
         # 2) Keyless approach: fetch a real topical image and add motion
-        image_ok = fetch_topic_image(keywords, frame_path)
+        image_ok = fetch_topic_image(queries, frame_path)
         is_photo = image_ok
 
         # 3) Fallback: AI image, then generated slide
